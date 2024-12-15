@@ -365,7 +365,7 @@ impl Client {
 impl Connection {
     fn new(sender: Sender<transport::Full, mtp::Encrypted>, request_tx: Enqueuer) -> Self {
         Self {
-            sender: AsyncMutex::new(sender),
+            sender: Arc::new(AsyncMutex::new(sender)),
             request_tx: RwLock::new(request_tx),
             step_counter: AtomicU32::new(0),
         }
@@ -416,7 +416,6 @@ impl Connection {
 
     async fn step(&self) -> Result<Vec<tl::enums::Updates>, sender::ReadError> {
         let ticket_number = self.step_counter.load(Ordering::SeqCst);
-        let mut sender = self.sender.lock().await;
         match self.step_counter.compare_exchange(
             ticket_number,
             // As long as the counter's modulo is larger than the amount of concurrent tasks, we're fine.
@@ -424,7 +423,13 @@ impl Connection {
             Ordering::SeqCst,
             Ordering::SeqCst,
         ) {
-            Ok(_) => sender.step().await, // We're the one to drive IO.
+            Ok(_) => {
+                let sender = self.sender.clone();
+                // Run inside task to prevent cancellation issues
+                tokio::task::spawn(async move {
+                    sender.lock().await.step().await
+                }).await.unwrap()
+            }, // We're the one to drive IO.
             Err(_) => Ok(Vec::new()),     // A different task drove IO.
         }
     }
